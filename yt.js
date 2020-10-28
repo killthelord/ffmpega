@@ -2637,7 +2637,7 @@ module.exports = class Cache extends Map {
     return null;
   }
   async getOrSet(key, fn) {
-    if (this.get(key)) {
+    if (this.has(key)) {
       return this.get(key);
     } else {
       let value = await fn();
@@ -3086,6 +3086,13 @@ module.exports = {
     audioBitrate: null,
   },
 
+  300: {
+    mimeType: 'video/ts; codecs="H.264, aac"',
+    qualityLabel: '720p',
+    bitrate: 1318000,
+    audioBitrate: 48,
+  },
+
   302: {
     mimeType: 'video/webm; codecs="VP9"',
     qualityLabel: '720p HFR',
@@ -3228,6 +3235,17 @@ const createStream = options => {
 };
 
 
+const pipeAndSetEvents = (req, stream, end) => {
+  // Forward events from the request to the stream.
+  [
+    'abort', 'request', 'response', 'error', 'redirect', 'retry', 'reconnect',
+  ].forEach(event => {
+    req.prependListener(event, stream.emit.bind(stream, event));
+  });
+  req.pipe(stream, { end });
+};
+
+
 /**
  * Chooses a format to download.
  *
@@ -3270,17 +3288,6 @@ const downloadFromInfoCallback = (stream, info, options) => {
   const dlChunkSize = options.dlChunkSize || 1024 * 1024 * 10;
   let req;
   let shouldEnd = true;
-  const pipeAndSetEvents = () => {
-    // Forward events from the request to the stream.
-    [
-      'abort', 'request', 'response', 'error', 'redirect', 'retry', 'reconnect',
-    ].forEach(event => {
-      req.prependListener(event, arg => {
-        stream.emit(event, arg);
-      });
-    });
-    req.pipe(stream, { end: shouldEnd });
-  };
 
   if (format.isHLS || format.isDashMPD) {
     req = m3u8stream(format.url, {
@@ -3295,7 +3302,7 @@ const downloadFromInfoCallback = (stream, info, options) => {
     req.on('progress', (segment, totalSegments) => {
       stream.emit('progress', segment.size, segment.num, totalSegments);
     });
-    pipeAndSetEvents();
+    pipeAndSetEvents(req, stream, shouldEnd);
   } else {
     const requestOptions = Object.assign({}, options.requestOptions, {
       maxReconnects: 6,
@@ -3303,7 +3310,7 @@ const downloadFromInfoCallback = (stream, info, options) => {
       backoff: { inc: 500, max: 10000 },
     });
 
-    const shouldBeChunked = !format.hasAudio || !format.hasVideo;
+    let shouldBeChunked = dlChunkSize !== 0 && (!format.hasAudio || !format.hasVideo);
 
     if (shouldBeChunked) {
       let start = (options.range && options.range.start) || 0;
@@ -3311,7 +3318,8 @@ const downloadFromInfoCallback = (stream, info, options) => {
       const rangeEnd = options.range && options.range.end;
 
       contentLength = options.range ?
-        (rangeEnd ? rangeEnd + 1 : format.contentLength) - start : format.contentLength;
+        (rangeEnd ? rangeEnd + 1 : parseInt(format.contentLength)) - start :
+        parseInt(format.contentLength);
 
       const getNextChunk = () => {
         if (!rangeEnd && end >= contentLength) end = 0;
@@ -3332,7 +3340,7 @@ const downloadFromInfoCallback = (stream, info, options) => {
             getNextChunk();
           }
         });
-        pipeAndSetEvents();
+        pipeAndSetEvents(req, stream, shouldEnd);
       };
       getNextChunk();
     } else {
@@ -3348,12 +3356,10 @@ const downloadFromInfoCallback = (stream, info, options) => {
       req = miniget(format.url, requestOptions);
       req.on('response', res => {
         if (stream._isDestroyed) { return; }
-        if (!contentLength) {
-          contentLength = parseInt(res.headers['content-length'], 10);
-        }
+        contentLength = contentLength || parseInt(res.headers['content-length']);
       });
       req.on('data', ondata);
-      pipeAndSetEvents();
+      pipeAndSetEvents(req, stream, shouldEnd);
     }
   }
 
@@ -3632,39 +3638,47 @@ exports.getBasicInfo = async(id, options) => {
     'x-youtube-identity-token': exports.cookieCache.get(cookie || 'browser') || '',
   }, reqOptions.headers);
 
-  const setIdentityToken = async key => {
+  const setIdentityToken = async(key, throwIfNotFound) => {
+    if (reqOptions.headers['x-youtube-identity-token']) { return; }
     let token = await exports.cookieCache.getOrSet(key, async() => {
       let watchPageBody = await miniget(watchPageURL, reqOptions).text();
       let match = watchPageBody.match(/(["'])ID_TOKEN\1[:,]\s?"([^"]+)"/);
-      if (!match) {
-        throw Error('Cookie header used in request, but unable to find YouTube identity token');
+      if (!match && throwIfNotFound) {
+        throw Error('Cookie header used in request, but nunable to find YouTube identity token');
       }
-      return match[2];
+      return match && match[2];
     });
     reqOptions.headers['x-youtube-identity-token'] = token;
   };
 
-  if (cookie && !reqOptions.headers['x-youtube-identity-token']) {
-    await setIdentityToken(cookie);
+  let getWatchPage = async(maxRetries = 1) => {
+    let body = await miniget(jsonEndpointURL, reqOptions).text();
+    let info;
+    try {
+      let jsonClosingChars = /^[)\]}'\s]+/;
+      if (jsonClosingChars.test(body)) {
+        body = body.replace(jsonClosingChars, '');
+      }
+      let parsedBody = JSON.parse(body);
+      if (parsedBody.reload === 'now' && maxRetries > 0) {
+        await setIdentityToken('browser', false);
+        return getWatchPage(maxRetries - 1);
+      }
+      if (!Array.isArray(parsedBody)) {
+        throw Error('Unable to retrieve video metadata');
+      }
+      info = parsedBody.reduce((part, curr) => Object.assign(curr, part), {});
+    } catch (err) {
+      throw Error(`Error parsing info: ${err.message}`);
+    }
+    return [info, body];
+  };
+
+  if (cookie) {
+    await setIdentityToken(cookie, true);
   }
 
-  let body = await miniget(jsonEndpointURL, reqOptions).text();
-  let info;
-  try {
-    let parsedBody = JSON.parse(body);
-    if (parsedBody.reload === 'now' && !reqOptions.headers['x-youtube-identity-token']) {
-      await setIdentityToken('browser');
-      body = await miniget(jsonEndpointURL, reqOptions).text();
-      parsedBody = JSON.parse(body);
-    }
-    if (!Array.isArray(parsedBody)) {
-      throw Error('Cookie header used in request, but unable to retrieve video metadata');
-    }
-    info = parsedBody.reduce((part, curr) => Object.assign(curr, part), {});
-  } catch (err) {
-    throw Error(`Error parsing info: ${err.message}`);
-  }
-
+  let [info, body] = await getWatchPage();
   let playErr = util.playError(info, 'ERROR');
   if (playErr) {
     throw playErr;
@@ -3675,7 +3689,7 @@ exports.getBasicInfo = async(id, options) => {
     // and requires an account logged in to view, try the embed page.
     let embedUrl = `${EMBED_URL + id}?${params}`;
     body = await miniget(embedUrl, options.requestOptions).text();
-    let jsonStr = util.between(body, '\'PLAYER_CONFIG\': ', '</script>');
+    let jsonStr = util.between(body, /(['"])PLAYER_(CONFIG|VARS)\1:\s?/, '</script>');
     let config;
     if (!jsonStr) {
       throw Error('Could not find player config');
@@ -3686,9 +3700,12 @@ exports.getBasicInfo = async(id, options) => {
       throw Error(`Error parsing config: ${err.message}`);
     }
     playErr = util.playError(info, 'LOGIN_REQUIRED');
-    if (!config.args.player_response && !config.args.embedded_player_response && playErr) {
+    if ((!config.args || (!config.args.player_response && !config.args.embedded_player_response)) &&
+      !config.embedded_player_response && playErr) {
       throw playErr;
     }
+    let html5playerRes = /<script\s+src="([^"]+)"\s+name="player_ias\/base"\s*>/.exec(body);
+    info.html5player = html5playerRes ? html5playerRes[1] : null;
     info.player = config;
   }
   return gotConfig(id, options, info, body);
@@ -3771,7 +3788,7 @@ const gotConfig = async(id, options, info, body) => {
     info.player_response.microformat.playerMicroformatRenderer,
     info.player_response.videoDetails, additional);
   info.related_videos = extras.getRelatedVideos(info);
-  info.html5player = info.player && info.player.assets && info.player.assets.js;
+  info.html5player = info.html5player || (info.player && info.player.assets && info.player.assets.js);
 
   // TODO: Remove these warnings later and remove the properties.
   // Remember to remove from typings too.
@@ -3843,10 +3860,30 @@ const getDashManifest = (url, options) => new Promise((resolve, reject) => {
   let formats = {};
   const parser = sax.parser(false);
   parser.onerror = reject;
+  let adaptationSet;
   parser.onopentag = node => {
-    if (node.name === 'REPRESENTATION') {
+    if (node.name === 'ADAPTATIONSET') {
+      adaptationSet = node.attributes;
+    } else if (node.name === 'REPRESENTATION') {
       const itag = parseInt(node.attributes.ID);
-      formats[itag] = { itag, url };
+      if (!isNaN(itag)) {
+        formats[itag] = {
+          itag, url,
+          bitrate: parseInt(node.attributes.BANDWIDTH),
+          mimeType: `${adaptationSet.MIMETYPE}; codecs="${node.attributes.CODECS}"`,
+        };
+        if (node.attributes.HEIGHT) {
+          Object.assign(formats[itag], {
+            width: parseInt(node.attributes.WIDTH),
+            height: parseInt(node.attributes.HEIGHT),
+            fps: parseInt(node.attributes.FRAMERATE),
+          });
+        } else {
+          Object.assign(formats[itag], {
+            audioSampleRate: node.attributes.AUDIOSAMPLINGRATE,
+          });
+        }
+      }
     }
   };
   parser.onend = () => { resolve(formats); };
@@ -3871,10 +3908,10 @@ const getM3U8 = async(url, options) => {
   let formats = {};
   body
     .split('\n')
-    .filter(line => /https?:\/\//.test(line))
+    .filter(line => /^https?:\/\//.test(line))
     .forEach(line => {
       const itag = parseInt(line.match(/\/itag\/(\d+)\//)[1]);
-      formats[itag] = { itag: itag, url: line };
+      formats[itag] = { itag, url: line };
     });
   return formats;
 };
@@ -4261,6 +4298,9 @@ exports.sortFormats = (a, b) => {
  */
 exports.chooseFormat = (formats, options) => {
   if (typeof options.format === 'object') {
+    if (!options.format.url) {
+      throw Error('Invalid format given, did you use `ytdl.getInfo()`?');
+    }
     return options.format;
   }
 
@@ -4351,6 +4391,7 @@ const sortFormatsSimple = (formats, audioOnly = false) => formats.sort((a, b) =>
 exports.filterFormats = (formats, filter) => {
   let fn;
   switch (filter) {
+    case 'videoandaudio':
     case 'audioandvideo':
       fn = format => format.hasVideo && format.hasAudio;
       break;
@@ -4391,9 +4432,17 @@ exports.filterFormats = (formats, filter) => {
  * @returns {string}
  */
 exports.between = (haystack, left, right) => {
-  let pos = haystack.indexOf(left);
-  if (pos === -1) { return ''; }
-  haystack = haystack.slice(pos + left.length);
+  let pos;
+  if (left instanceof RegExp) {
+    const match = haystack.match(left);
+    if (!match) { return ''; }
+    pos = match.index + match[0].length;
+  } else {
+    pos = haystack.indexOf(left);
+    if (pos === -1) { return ''; }
+    pos += left.length;
+  }
+  haystack = haystack.slice(pos);
   pos = haystack.indexOf(right);
   if (pos === -1) { return ''; }
   haystack = haystack.slice(0, pos);
@@ -4497,6 +4546,8 @@ exports.validateURL = string => {
  */
 exports.addFormatMeta = format => {
   format = Object.assign({}, FORMATS[format.itag], format);
+  format.qualityLabel =
+    format.qualityLabel || (format.height ? `${format.height}p${format.fps >= 60 ? format.fps : ''}` : null);
   format.hasVideo = !!format.qualityLabel;
   format.hasAudio = !!format.audioBitrate;
   format.container = format.mimeType ?
@@ -4549,8 +4600,8 @@ exports.parseAbbreviatedNumber = string => {
   if (match) {
     let [, num, multi] = match;
     num = parseFloat(num);
-    return multi === 'M' ? num * 1000000 :
-      multi === 'K' ? num * 1000 : num;
+    return Math.round(multi === 'M' ? num * 1000000 :
+      multi === 'K' ? num * 1000 : num);
   }
   return null;
 };
